@@ -39,9 +39,21 @@ class OpenPose(object):
         np.ctypeslib.ndpointer(dtype=np.int32), np.ctypeslib.ndpointer(dtype=np.uint8), ct.c_bool]
     _libop.forward.restype = None
 
+    _libop.forward_hands.argtypes = [
+        ct.c_void_p, np.ctypeslib.ndpointer(dtype=np.uint8),
+        ct.c_size_t, ct.c_size_t,
+        np.ctypeslib.ndpointer(dtype=np.float32), ct.c_size_t,
+        np.ctypeslib.ndpointer(dtype=np.int32), np.ctypeslib.ndpointer(dtype=np.uint8), ct.c_bool]
+    _libop.forward_hands.restype = None
+
     _libop.getOutputs.argtypes = [
         ct.c_void_p, np.ctypeslib.ndpointer(dtype=np.float32)]
     _libop.getOutputs.restype = None
+
+
+    _libop.getOutputsHands.argtypes = [
+        ct.c_void_p, np.ctypeslib.ndpointer(dtype=np.float32), np.ctypeslib.ndpointer(dtype=np.float32)]
+    _libop.getOutputsHands.restype = None
 
     _libop.poseFromHeatmap.argtypes = [
         ct.c_void_p, np.ctypeslib.ndpointer(dtype=np.uint8),
@@ -106,6 +118,35 @@ class OpenPose(object):
         if display:
             return array, displayImage
         return array
+
+    def forward_hands(self, image, hands_rectangles, display = False):
+        """
+        Forward: Takes in an image and returns the hands 2D poses, along with drawn image if required
+
+        Parameters
+        ----------
+        image : color image of type ndarray
+        hands_rectangles: boxes containing the hands in the format [[left_hand,right_hand] * People] where each hand is the bounding box in the format [x1,y1,x2,y2]
+        display : If set to true, we return both the pose and an annotated image for visualization
+
+        Returns
+        -------
+        array: ndarray of human 2D poses [People * BodyPart * XYConfidence]
+        displayImage : image for visualization
+        """
+        shape = image.shape
+        displayImage = np.zeros(shape=(image.shape),dtype=np.uint8)
+        size = np.zeros(shape=(6),dtype=np.int32)
+        hands_rectangles = np.array(hands_rectangles,dtype=np.float32)
+
+        self._libop.forward_hands(self.op, image, shape[0], shape[1], hands_rectangles, len(hands_rectangles), size, displayImage, display)
+        left_hand = np.zeros(shape=(size[:3]),dtype=np.float32)
+        right_hand = np.zeros(shape=(size[3:]),dtype=np.float32)
+
+        self._libop.getOutputsHands(self.op, left_hand, right_hand)
+        if display:
+            return left_hand, right_hand, displayImage
+        return left_hand, right_hand
 
     def poseFromHM(self, image, hm, ratios=[1]):
         """
@@ -240,4 +281,3 @@ if __name__ == "__main__":
     while 1:
         cv2.imshow("output", output_image)
         cv2.waitKey(15)
-

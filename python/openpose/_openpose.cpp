@@ -8,9 +8,12 @@
 #include <openpose/gui/headers.hpp>
 #include <openpose/pose/headers.hpp>
 #include <openpose/utilities/headers.hpp>
+#include <openpose/hand/handExtractorCaffe.hpp>
+#include <openpose/hand/handCpuRenderer.hpp>
 #include <caffe/caffe.hpp>
 #include <stdlib.h>
 
+#include <openpose/core/rectangle.hpp>
 #include <openpose/net/bodyPartConnectorCaffe.hpp>
 #include <openpose/net/nmsCaffe.hpp>
 #include <openpose/net/resizeAndMergeCaffe.hpp>
@@ -46,6 +49,8 @@ public:
     std::unique_ptr<op::PoseCpuRenderer> poseRenderer;
     std::unique_ptr<op::FrameDisplayer> frameDisplayer;
     std::unique_ptr<op::ScaleAndSizeExtractor> scaleAndSizeExtractor;
+    std::unique_ptr<op::HandExtractorCaffe> handExtractorNet;
+    std::unique_ptr<op::HandCpuRenderer> handRenderer;
 
     std::unique_ptr<op::ResizeAndMergeCaffe<float>> resizeAndMergeCaffe;
     std::unique_ptr<op::NmsCaffe<float>> nmsCaffe;
@@ -73,7 +78,7 @@ public:
 #ifdef USE_CUDA
         caffe::Caffe::set_mode(caffe::Caffe::GPU);
         caffe::Caffe::SetDevice(mGpuID);
-#elif defined USE_OPENCL
+#elif USE_OPENCL
         caffe::Caffe::set_mode(caffe::Caffe::GPU);
         std::vector<int> devices;
         const int maxNumberGpu = op::OpenCL::getTotalGPU();
@@ -114,6 +119,10 @@ public:
             (float)FLAGS_alpha_pose });
         frameDisplayer = std::unique_ptr<op::FrameDisplayer>(new op::FrameDisplayer{ "OpenPose Tutorial - Example 1", outputSize });
 
+        handExtractorNet = std::unique_ptr<op::HandExtractorCaffe>(new op::HandExtractorCaffe(
+            op::flagsToPoint("368x368"),op::flagsToPoint("368x368"),
+            FLAGS_model_folder, FLAGS_num_gpu_start));
+        handRenderer = std::unique_ptr<op::HandCpuRenderer>(new op::HandCpuRenderer{(float)FLAGS_render_threshold});
         // Custom
         resizeAndMergeCaffe = std::unique_ptr<op::ResizeAndMergeCaffe<float>>(new op::ResizeAndMergeCaffe<float>{});
         nmsCaffe = std::unique_ptr<op::NmsCaffe<float>>(new op::NmsCaffe<float>{});
@@ -124,6 +133,7 @@ public:
 
         // Step 4 - Initialize resources on desired thread (in this case single thread, i.e., we init resources here)
         poseExtractorCaffe->initializationOnThread();
+        handExtractorNet->initializationOnThread();
         poseRenderer->initializationOnThread();
     }
 
@@ -142,6 +152,35 @@ public:
         {
             op::error(e.what(), __LINE__, __FUNCTION__, __FILE__);
             return{};
+        }
+    }
+
+    void forward_hands(const cv::Mat& inputImage, const std::vector<std::array<op::Rectangle<float>, 2>> handRectangles,
+        std::array<op::Array<float>, 2>& handKeypoints, cv::Mat& displayImage, bool display = false) {
+        op::OpOutputToCvMat opOutputToCvMat;
+        op::CvMatToOpInput cvMatToOpInput;
+        op::CvMatToOpOutput cvMatToOpOutput;
+        if (inputImage.empty())
+            op::error("Could not open or find the image: ", __LINE__, __FUNCTION__, __FILE__);
+        const op::Point<int> imageSize{ inputImage.cols, inputImage.rows };
+        // Step 2 - Get desired scale sizes
+        std::vector<double> scaleInputToNetInputs;
+        std::vector<op::Point<int>> netInputSizes;
+        double scaleInputToOutput;
+        op::Point<int> outputResolution;
+        std::tie(scaleInputToNetInputs, netInputSizes, scaleInputToOutput, outputResolution)
+            = scaleAndSizeExtractor->extract(imageSize);
+        // Step 3 - Format input image to OpenPose input and output formats
+        const auto netInputArray = cvMatToOpInput.createArray(inputImage, scaleInputToNetInputs, netInputSizes);
+
+        handExtractorNet->forwardPass(handRectangles,inputImage);
+        handKeypoints = handExtractorNet->getHandKeypoints();
+        if (display) {
+            auto outputArray = cvMatToOpOutput.createArray(inputImage, scaleInputToOutput, outputResolution);
+            // Step 5 - Render handKeypoints
+            handRenderer->renderHandInherited(outputArray, handKeypoints);
+            // Step 6 - OpenPose output format to cv::Mat
+            displayImage = opOutputToCvMat.formatToCvMat(outputArray);
         }
     }
 
@@ -188,7 +227,7 @@ public:
         resizeAndMergeCaffe->Reshape(caffeNetOutputBlobs, { heatMapsBlob.get() },
             op::getPoseNetDecreaseFactor(poseModel), 1.f / 1.f, true,
             0);
-        nmsCaffe->Reshape({ heatMapsBlob.get() }, { peaksBlob.get() }, op::getPoseMaxPeaks(),
+        nmsCaffe->Reshape({ heatMapsBlob.get() }, { peaksBlob.get() }, op::getPoseMaxPeaks(poseModel),
             op::getPoseNumberBodyParts(poseModel), 0);
         bodyPartConnectorCaffe->Reshape({ heatMapsBlob.get(), peaksBlob.get() });
 
@@ -217,7 +256,7 @@ public:
         std::vector<caffe::Blob<float>*> peaksBlobs{ peaksBlob.get() };
 #ifdef USE_CUDA
         resizeAndMergeCaffe->Forward_gpu(caffeNetOutputBlobs, heatMapsBlobs); // ~5ms
-#elif defined USE_OPENCL
+#elif USE_OPENCL
         resizeAndMergeCaffe->Forward_ocl(caffeNetOutputBlobs, heatMapsBlobs); // ~5ms
 #else
         resizeAndMergeCaffe->Forward_cpu(caffeNetOutputBlobs, heatMapsBlobs); // ~5ms
@@ -226,7 +265,7 @@ public:
         nmsCaffe->setThreshold((float)poseExtractorCaffe->get(op::PoseProperty::NMSThreshold));
 #ifdef USE_CUDA
         nmsCaffe->Forward_gpu(heatMapsBlobs, peaksBlobs);// ~2ms
-#elif defined USE_OPENCL
+#elif USE_OPENCL
         nmsCaffe->Forward_ocl(heatMapsBlobs, peaksBlobs);// ~2ms
 #else
         nmsCaffe->Forward_cpu(heatMapsBlobs, peaksBlobs);// ~2ms
@@ -267,6 +306,7 @@ extern "C" {
 
     typedef void* c_OP;
     op::Array<float> output;
+    std::array<op::Array<float>, 2> handsOutput;
 
     OP_EXPORT c_OP newOP(int logging_level,
         char* output_resolution,
@@ -301,10 +341,61 @@ extern "C" {
         }
         if (display) memcpy(displayImg, displayImage.ptr(), sizeof(unsigned char)*rows*cols * 3);
     }
+
+
+    OP_EXPORT void forward_hands(c_OP op, unsigned char* img, size_t rows, size_t cols,
+         float* hRects, size_t hRects_size,
+         int* size, unsigned char* displayImg, bool display) {
+		OpenPose* openPose = (OpenPose*)op;
+		cv::Mat image(rows, cols, CV_8UC3, img);
+		cv::Mat displayImage(rows, cols, CV_8UC3, displayImg);
+
+        std::vector<std::array<op::Rectangle<float>, 2>> handRectangles;
+        for (int i = 0; i<hRects_size; i++) {
+            op::Rectangle<float> left_hand = {hRects[i], hRects[i+1], hRects[i+2], hRects[i+3]};
+            op::Rectangle<float> right_hand = {hRects[i+4], hRects[i+5], hRects[i+6], hRects[i+7]};
+            std::array<op::Rectangle<float>, 2> body_hands = {left_hand, right_hand};
+            handRectangles.emplace_back(body_hands);
+        }
+
+		openPose->forward_hands(image, handRectangles, handsOutput, displayImage, display);
+        // Left hand
+		if (handsOutput[0].getSize().size()) {
+			size[0] = handsOutput[0].getSize()[0];
+			size[1] = handsOutput[0].getSize()[1];
+			size[2] = handsOutput[0].getSize()[2];
+        } else {
+            size[0] = 0; size[1] = 0; size[2] = 0;
+        }
+        // Right hand
+    	if (handsOutput[1].getSize().size()) {
+			size[3] = handsOutput[1].getSize()[0];
+			size[4] = handsOutput[1].getSize()[1];
+			size[5] = handsOutput[1].getSize()[2];
+		}
+		else {
+			size[3] = 0; size[4] = 0; size[5] = 0;
+		}
+		if (display) memcpy(displayImg, displayImage.ptr(), sizeof(unsigned char)*rows*cols * 3);
+	}
+
     OP_EXPORT void getOutputs(c_OP op, float* array) {
         if (output.getSize().size())
             memcpy(array, output.getPtr(), output.getSize()[0] * output.getSize()[1] * output.getSize()[2] * sizeof(float));
     }
+
+    /**
+     * Copies the hand keypoints to the python numpy float arrays
+     */
+    OP_EXPORT void getOutputsHands(c_OP op, float* left_hand, float* right_hand) {
+        if (handsOutput[0].getSize().size()) {
+			memcpy(left_hand, handsOutput[0].getPtr(), handsOutput[0].getSize()[0] * handsOutput[0].getSize()[1] * handsOutput[0].getSize()[2] * sizeof(float));
+        }
+        if (handsOutput[1].getSize().size()) {
+            memcpy(right_hand , handsOutput[1].getPtr(),  handsOutput[1].getSize()[0] * handsOutput[1].getSize()[1] * handsOutput[1].getSize()[2] * sizeof(float));
+        }
+	}
+
     OP_EXPORT void poseFromHeatmap(c_OP op, unsigned char* img, size_t rows, size_t cols, unsigned char* displayImg, float* hm, int* size, float* ratios) {
         OpenPose* openPose = (OpenPose*)op;
         cv::Mat image(rows, cols, CV_8UC3, img);
